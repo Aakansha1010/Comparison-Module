@@ -89,8 +89,10 @@ function handleFileSelect(event, fileNameId) {
         try {
             const csv = e.target.result;
             const data = parseCSV(csv);
-            
+            // If this is the SAP file (file1) and the selected module is Order Header/Line,
+            // apply SAP-to-business value mappings before storing the parsed data.
             if (fileNameId === 'fileName1') {
+                applySapMappings(data, selectedModule);
                 file1Data = data;
                 document.getElementById('fileName1').textContent = `✅ ${file.name}`;
             } else {
@@ -128,6 +130,163 @@ function parseCSV(csv) {
     }
 
     return { headers, data };
+}
+
+// Apply SAP value mappings for Order Header and Order Line modules
+function applySapMappings(parsed, moduleKey) {
+    if (!parsed || !parsed.headers || !Array.isArray(parsed.data)) return parsed;
+    moduleKey = moduleKey || selectedModule;
+    if (!moduleKey) return parsed;
+    // Only apply for order header / order line modules
+    if (!['order_header', 'order_line'].includes(moduleKey)) return parsed;
+
+    const statusRegex = /status/i;
+    const salesOrgRegex = /sales[_\s-]*org|sales[_\s-]*organization|salesorg/i;
+    const orderTypeRegex = /order[_\s-]*type|ordertype/i;
+
+    const salesOrgMap = {
+        '1511': 'ESP LV',
+        '1512': 'ESP-Automation',
+        '1513': 'ESP Agri',
+        '1514': 'ESP Retail',
+        '1515': 'ESP Services'
+    };
+
+    parsed.data.forEach(row => {
+        parsed.headers.forEach(header => {
+            const raw = row[header] !== undefined ? String(row[header]).trim() : '';
+            if (statusRegex.test(header)) {
+                if (raw === 'A') row[header] = 'Not Yet Processed';
+                else if (raw === 'B') row[header] = 'Partially Processed';
+                else if (raw === 'C') row[header] = 'Completely Processed';
+            } else if (salesOrgRegex.test(header)) {
+                if (salesOrgMap[raw]) row[header] = salesOrgMap[raw];
+            } else if (orderTypeRegex.test(header)) {
+                const up = raw.toUpperCase();
+                if (up === 'ZORS') row[header] = 'Standard Order';
+                else if (up === 'ZPRS') row[header] = 'Project Quotation';
+            }
+        });
+    });
+
+    return parsed;
+}
+
+// Normalize data formats across both SAP and SFDC files
+function normalizeDataFormats(parsed) {
+    if (!parsed || !parsed.headers || !Array.isArray(parsed.data)) return parsed;
+
+    // Helper to detect if a value looks like a date
+    function isDateLike(val) {
+        if (!val) return false;
+        const s = String(val).trim();
+        // Match common date patterns: YYYY-MM-DD, DD/MM/YYYY, MM/DD/YYYY, DD.MM.YYYY, YYYY-MM-DD HH:MM:SS
+        return /^(\d{1,4}[-/\.]\d{1,2}[-/\.]\d{1,4}|\d{1,4}[-/\.]\d{1,2}[-/\.]\d{1,4}\s\d{1,2}:\d{1,2}:\d{1,2})/.test(s);
+    }
+
+    // Helper to parse date and return ISO string (YYYY-MM-DD)
+    function parseDate(val) {
+        if (!val) return val;
+        const s = String(val).trim();
+        try {
+            const d = new Date(s);
+            if (!isNaN(d.getTime())) {
+                return d.toISOString().split('T')[0];
+            }
+        } catch (e) {}
+        return s;
+    }
+
+    // Helper to detect if a value looks like a number
+    function isNumberLike(val) {
+        if (!val) return false;
+        const s = String(val).trim();
+        // Match numbers including those with commas, decimal points, or spaces as thousands separator
+        return /^-?[\d,.\s]+$/.test(s) && /\d/.test(s);
+    }
+
+    // Helper to normalize numbers to a consistent format (remove spaces, handle commas)
+    function normalizeNumber(val) {
+        if (!val) return val;
+        const s = String(val).trim();
+        // Remove spaces (thousands separator in some locales)
+        let normalized = s.replace(/\s/g, '');
+        // If it contains both comma and period, determine which is decimal separator
+        if (normalized.includes(',') && normalized.includes('.')) {
+            const lastCommaIdx = normalized.lastIndexOf(',');
+            const lastDotIdx = normalized.lastIndexOf('.');
+            if (lastCommaIdx > lastDotIdx) {
+                // Comma is decimal: remove dots, replace comma with period
+                normalized = normalized.replace(/\./g, '').replace(',', '.');
+            } else {
+                // Dot is decimal: remove commas
+                normalized = normalized.replace(/,/g, '');
+            }
+        } else if (normalized.includes(',')) {
+            // Only comma: could be decimal (EU) or thousands (US with only one group)
+            // If there are <= 2 digits after comma, treat as decimal
+            const parts = normalized.split(',');
+            if (parts[1] && parts[1].length <= 2) {
+                normalized = parts[0].replace(/\./g, '') + '.' + parts[1];
+            } else {
+                normalized = normalized.replace(/,/g, '');
+            }
+        }
+        return normalized;
+    }
+
+    // Analyze column data types and normalize
+    const columnTypes = {};
+    
+    parsed.headers.forEach(header => {
+        let hasDateLike = false;
+        let hasNumberLike = false;
+        let sampleValues = [];
+
+        for (let i = 0; i < Math.min(parsed.data.length, 10); i++) {
+            const val = parsed.data[i][header];
+            if (val && String(val).trim().length > 0) {
+                sampleValues.push(val);
+                if (isDateLike(val)) hasDateLike = true;
+                if (isNumberLike(val)) hasNumberLike = true;
+            }
+        }
+
+        // Determine primary type: date > number > text
+        if (hasDateLike && sampleValues.length >= 2 && sampleValues.filter(isDateLike).length >= sampleValues.length * 0.5) {
+            columnTypes[header] = 'date';
+        } else if (hasNumberLike && sampleValues.length >= 2 && sampleValues.filter(isNumberLike).length >= sampleValues.length * 0.8) {
+            columnTypes[header] = 'number';
+        } else {
+            columnTypes[header] = 'text';
+        }
+    });
+
+    // Normalize values by detected type
+    parsed.data.forEach(row => {
+        parsed.headers.forEach(header => {
+            const type = columnTypes[header];
+            let val = row[header];
+            
+            if (val === undefined || val === null || val === '') {
+                row[header] = '';
+            } else {
+                const s = String(val).trim();
+                if (type === 'date') {
+                    row[header] = parseDate(s);
+                } else if (type === 'number') {
+                    row[header] = normalizeNumber(s);
+                } else {
+                    // For text: trim and preserve case
+                    row[header] = s;
+                }
+            }
+        });
+    });
+
+    // Store column type info for reference
+    parsed.columnTypes = columnTypes;
+    return parsed;
 }
 
 // Update key column options
@@ -188,6 +347,10 @@ function performComparison() {
     }
 
     try {
+        // Normalize data formats in both files before comparison
+        normalizeDataFormats(file1Data);
+        normalizeDataFormats(file2Data);
+
         // Get common columns
         const commonCols = file1Data.headers.filter(h => 
             file2Data.headers.includes(h)
